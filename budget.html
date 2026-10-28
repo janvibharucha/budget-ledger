@@ -210,6 +210,9 @@
   .btn:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
   .btn.ghost { background: transparent; color: var(--muted); border-color: var(--line); }
   .btn.ghost:hover { background: var(--surface-2); filter: none; }
+  .btn.ok { background: var(--pos); animation: pop .25s ease; }
+  @keyframes pop { 0% { transform: scale(.97); } 55% { transform: scale(1.03); } 100% { transform: scale(1); } }
+  @media (prefers-reduced-motion: reduce) { .btn.ok { animation: none; } }
 
   /* Month / period bar */
   .bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
@@ -630,6 +633,18 @@
     s.setAttribute("data-base", html);
     s.innerHTML = html;
   }
+  // briefly turn a submit button into a success confirmation, then restore it
+  function flashBtn(btn, okText) {
+    if (!btn) return;
+    if (!btn.getAttribute("data-label")) btn.setAttribute("data-label", btn.innerHTML);
+    btn.classList.add("ok");
+    btn.innerHTML = okText;
+    clearTimeout(btn._t);
+    btn._t = setTimeout(function () {
+      btn.classList.remove("ok");
+      btn.innerHTML = btn.getAttribute("data-label");
+    }, 1500);
+  }
 
   // ===== tabs =====
   var TABS = [
@@ -735,8 +750,8 @@
     setCatFilter("All");
     document.getElementById("exp-amount").value = "";
     document.getElementById("exp-note").value = "";
-    renderSpend();
     saveDoc("expenses", rec);
+    flashBtn(e.target.querySelector('button[type="submit"]'), "✓ Added!");
   };
 
   // ===== add income/cashflow =====
@@ -754,32 +769,41 @@
     }
     ["inc-pay", "inc-sav", "inc-brk", "inc-401", "inc-roth", "inc-cc"].forEach(function (id) { document.getElementById(id).value = ""; });
     saveDoc("income", rec);
+    flashBtn(e.target.querySelector('button[type="submit"]'), "✓ Added!");
   };
   function round2(id) { return Math.round(num(document.getElementById(id).value) * 100) / 100; }
 
   // ===== persistence =====
+  function arrOf(coll) { return coll === "expenses" ? expenses : incomes; }
+
   function saveDoc(coll, rec) {
+    // Always show the new entry immediately (optimistic), then persist.
+    // The realtime subscription later reconciles to the server's copy;
+    // if it lags or drops, the optimistic entry keeps the UI correct.
+    rec.id = "pending-" + rec.ts + "-" + Math.random().toString(36).slice(2, 6);
+    arrOf(coll).push(rec);
+    renderAll();
     if (db) {
-      db.collection(coll).add(rec).then(function () { toast("Saved"); })
-        .catch(function (err) {
-          if (err && err.code === "invalid_argument") { canWrite = false; showReadOnly(); }
-          else { toast("Couldn't save"); }
-        });
-    } else {
-      // local fallback so the app works before/without the store
-      rec.id = "local-" + rec.ts + "-" + Math.random().toString(36).slice(2, 6);
-      (coll === "expenses" ? expenses : incomes).push(rec);
-      renderAll();
+      db.collection(coll).add(rec).then(function (ref) {
+        toast("Saved");
+        if (ref && ref.id) rec.id = ref.id; // adopt the real id so delete works even without a snapshot
+      }).catch(function (err) {
+        var a = arrOf(coll), i = a.indexOf(rec);
+        if (i >= 0) a.splice(i, 1);
+        renderAll();
+        if (err && err.code === "invalid_argument") { canWrite = false; showReadOnly(); }
+        else { toast("Couldn't save"); }
+      });
     }
   }
   function delDoc(coll, id) {
     if (!canWrite) { toast("Read-only"); return; }
-    if (db && String(id).indexOf("local-") !== 0) {
+    // Remove it from view immediately, then delete on the server.
+    if (coll === "expenses") expenses = expenses.filter(function (r) { return r.id !== id; });
+    else incomes = incomes.filter(function (r) { return r.id !== id; });
+    renderAll();
+    if (db && String(id).indexOf("local-") !== 0 && String(id).indexOf("pending-") !== 0) {
       db.collection(coll).doc(id).delete().then(function () { toast("Deleted"); }).catch(function () { toast("Couldn't delete"); });
-    } else {
-      if (coll === "expenses") expenses = expenses.filter(function (r) { return r.id !== id; });
-      else incomes = incomes.filter(function (r) { return r.id !== id; });
-      renderAll();
     }
   }
   function showReadOnly() {
@@ -1112,16 +1136,23 @@
       if (!store) { setBase('<b>Local</b> · not signed in'); return; }
       db = store;
       setBase('<b>Synced</b>');
+
+      function mapDocs(snap) { return snap.docs.map(function (d) { var o = d.data() || {}; o.id = d.id; return o; }); }
+      // Seed once with a direct read, so existing entries show even if the
+      // realtime stream is slow to deliver its first snapshot.
+      store.collection("expenses").get().then(function (snap) { expenses = mapDocs(snap); renderSpend(); renderInsights(); }).catch(function () {});
+      store.collection("income").get().then(function (snap) { incomes = mapDocs(snap); renderTrack(); renderInsights(); }).catch(function () {});
+      // Then keep in sync live (also catches changes from other devices).
       store.collection("expenses").onSnapshot(function (snap) {
-        expenses = snap.docs.map(function (d) { var o = d.data() || {}; o.id = d.id; return o; });
+        expenses = mapDocs(snap);
         renderSpend();
         renderInsights();
-      }, function () {});
+      }, function (e) { setBase('<b>Synced</b> · live refresh paused'); });
       store.collection("income").onSnapshot(function (snap) {
-        incomes = snap.docs.map(function (d) { var o = d.data() || {}; o.id = d.id; return o; });
+        incomes = mapDocs(snap);
         renderTrack();
         renderInsights();
-      }, function () {});
+      }, function (e) { });
     });
     window.claude.use("user").then(function (u) {
       if (u && u.can) {
